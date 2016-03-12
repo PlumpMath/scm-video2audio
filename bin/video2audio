@@ -1,0 +1,213 @@
+#!/usr/bin/guile \
+-L ../ext/file-glob/lib -e main -s
+!#
+;; -*- mode: scheme; coding: utf-8; -*-
+(use-modules (srfi srfi-1)
+             (srfi srfi-13)
+             (ice-9 ftw)
+             (ice-9 getopt-long)
+             (file glob))
+
+(define %version "0.1")
+
+(define %default-args
+  '((audio-codec     . "libvorbis")
+    (audio-bitrates  . "128K")
+    (audio-sampling  . 44100)
+    (audio-channel   . 2)))
+
+(define %available-extensions
+  '(".flv" ".mp4" ".webm"))
+
+(define (any->string obj)
+  (cond ((number? obj)       (number->string obj))
+        ((symbol? obj)       (symbol->string obj))
+        (else                obj)))
+
+(define (alist-merge alist1 alist2)
+  (map (lambda (pair)
+         (let* ((key     (car pair))
+                (current (assq key alist2)))
+           (if current
+               (cons key (cdr current))
+               pair)))
+       alist1))
+
+(define (file-ctime>? left-file right-file)
+  (let ((left-stat  (stat left-file))
+        (right-stat (stat right-file)))
+    (> (stat:ctime left-stat)
+       (stat:ctime right-stat))))
+
+(define (dir-each proc base-dir)
+  (let ((dirs (remove proc (scandir base-dir))))
+    (map (lambda (dir)
+           (string-append base-dir file-name-separator-string dir))
+         dirs)))
+
+(define (in-dir proc dirname)
+  (let ((current-dir (getcwd)))
+    (chdir dirname)
+    (proc dirname)
+    (chdir current-dir)))
+
+(define* (basename-1 filename #:optional (suffix #f))
+  (let* ((suffix-index    (string-rindex filename #\.))
+         (original-suffix (if (and suffix-index
+                                   (equal? suffix ".*"))
+                              (substring filename suffix-index)
+                              suffix)))
+    (if suffix
+        (basename filename original-suffix)
+        ;; else
+        (basename filename))))
+
+(define (extname filename)
+  (let ((dot-index  (string-rindex filename #\.)))
+    (substring filename dot-index)))
+
+(define (mkdir-p path)
+  (let* ((separator  (string-ref file-name-separator-string 0))
+         (path-parts (cdr (string-split path separator))))
+    (for-each (lambda (n)
+                (let ((path (string-join (take path-parts n) file-name-separator-string 'prefix)))
+                  (unless (file-exists? path)
+                          (mkdir path))))
+              (iota (length path-parts) 1))))
+
+(define (change-extension filename new-suffix)
+  (let ((base-name (basename-1 filename ".*")))
+    (if (string-prefix? "." new-suffix)
+        (string-append base-name new-suffix)
+        ;; else
+        (string-append base-name "." new-suffix))))
+
+(define (file-join base-dir . components)
+  (let ((rest-path (string-join components file-name-separator-string 'infix)))
+  (if (string-suffix? base-dir file-name-separator-string)
+      (string-append base-dir rest-path)
+      ;; else
+      (string-append base-dir file-name-separator-string rest-path))))
+
+(define (show-version program ver)
+  (format #t "~A version ~A~%" program ver))
+
+(define (show-help program)
+  (format #t "~A is extract music from videos.~%" program)
+  (newline)
+  (display "Basic Command Line Usage:\n")
+  (format #t "    ~A -r --base-dir ~~/Music <video directory path> ...~%" program)
+  (format #t "    ~A <video file path> -o <audio file path>~%" program)
+  (newline)
+  (display "Options:\n")
+  (display "        --file [PATH]                video file to extract\n")
+  (display "    -o, --output [PATH]              path to audio file\n")
+  (display "        --base-dir PATH              path to audio file dir base\n")
+  (display "    -r, --recursive                  search for recursive\n")
+  (display "        --debug                      run debug mode\n")
+  (newline))
+
+(define (parse-argument program args)
+  (let* ((option-spec    '((version   (single-char #\v) (value #f))
+                           (help      (single-char #\h) (value #f))
+                           (recursive (single-char #\r) (value #f))
+                           (file      (single-char #\f) (value #t))
+                           (output    (single-char #\o) (value #t))
+                           (base-dir                    (value #t))
+                           (debug                       (value #f))))
+         (options        (getopt-long args option-spec))
+         (help-wanted    (option-ref options 'help     #f))
+         (version-wanted (option-ref options 'version  #f)))
+    (if (or help-wanted version-wanted)
+        (begin
+          (when version-wanted
+                (show-version program %version))
+          (when help-wanted
+                (show-help program))
+          (exit 0))
+        options)))
+
+(define (verifi-argument program options)
+  (write options)
+  (newline)
+  #t)
+
+(define (convert-recursive-many-files program options)
+  (let* ((input-dirs          (cdar options))
+         (base-dir            (option-ref options 'base-dir ""))
+         (output-parent-path  ""))
+    (for-each (lambda (input-dir)
+                (ftw input-dir
+                     (lambda (filename statinfo flag)
+                       (let ((output-parent-path (string-replace (dirname input-dir) base-dir)))
+                         (if (eq? flag 'directory)
+                             (begin
+                               (unless (file-exists? output-parent-path)
+                                       (mkdir-p output-parent-path))
+                               #t)
+                             (if (any (lambda (ext)
+                                        (equal? (extname filename) ext))
+                                      %available-extensions)
+                                 (begin
+                                   (let ((temp-parent-path (string-replace (dirname input-dir) base-dir)))
+                                     (unless (equal? temp-parent-path output-parent-path)
+                                             (set! output-parent-path temp-parent-path)))
+                                   (let ((in-filename  filename)
+                                         (out-filename (file-join output-parent-path (change-extension (basename-1 filename) ".ogg"))))
+                                     (convert-with-ffmpeg in-filename out-filename)))
+                                 #t))))))
+              input-dirs)))
+
+(define (convert-many-files program options)
+  (let ((input-dirs (cdar options))
+        (base-dir   (option-ref options 'base-dir "")))
+    (for-each (lambda (input-dir)
+                (in-dir (lambda (current-dir)
+                          (for-each (lambda (filename)
+                                      (let ((in-filename  (file-join input-dir filename))
+                                            (out-filename (file-join base-dir  (change-extension filename ".ogg"))))
+                                        (convert-with-ffmpeg in-filename out-filename)))
+                                    (glob input-dir))
+                          )
+                        input-dir))
+              input-dirs)
+    0))
+
+(define (convert-with-ffmpeg in-file out-file . args)
+  (if (null? args)
+      (set! args %default-args)
+      ;; else
+      (set! args (alist-merge %default-args args)))
+  (if (and (file-exists? out-file)
+           (file-ctime>? out-file in-file))
+      1
+      (begin
+        (write (list "ffmpeg"
+                     "-i"      in-file
+                     "-y" "-vn"
+                     "-acodec" (any->string (assoc-ref args 'audio-codec))
+                     "-ab"     (any->string (assoc-ref args 'audio-bitrates))
+                     "-ar"     (any->string (assoc-ref args 'audio-sampling))
+                     "-ac"     (any->string (assoc-ref args 'audio-channel))
+                     out-file))
+        (newline)
+        (system* "ffmpeg"
+                 "-i"      in-file
+                 "-y" "-vn"
+                 "-acodec" (any->string (assoc-ref args 'audio-codec))
+                 "-ab"     (any->string (assoc-ref args 'audio-bitrates))
+                 "-ar"     (any->string (assoc-ref args 'audio-sampling))
+                 "-ac"     (any->string (assoc-ref args 'audio-channel))
+                 out-file))))
+
+(define (main args)
+  (let* ((program          (basename (car args)))
+         (options          (parse-argument program args))
+         (serch-recursive? (option-ref options 'recursive #f)))
+
+    (unless (verifi-argument program options)
+            (exit 1))
+
+    (if serch-recursive?
+        (convert-recursive-many-files program options)
+        (convert-many-files           program options))))
